@@ -42,11 +42,11 @@ func (p *Publisher[T]) Publish(pubCtx context.Context, data T) error {
 	p.subscribers.Range(func(subscriber *Subscriber[T], _ struct{}) bool {
 		select {
 		case subscriber.ch <- data:
-		case <-pubCtx.Done():
-			return false
 		case <-subscriber.subCtx.Done():
 			close(subscriber.ch)
 			p.subscribers.Delete(subscriber)
+		case <-pubCtx.Done():
+			return false
 		}
 		return true
 	})
@@ -64,7 +64,7 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
 		case eventSubscriber.ch <- subscriber:
 		case <-subCtx.Done():
 			close(ch)
-			p.newSubscriberSubscribers.Delete(eventSubscriber)
+			p.subscribers.Delete(subscriber)
 			return false
 		}
 		return true
