@@ -38,6 +38,7 @@ func (p *Publisher[T]) PublishChannel(ctx context.Context, pubChan chan T) {
 		}
 	}
 }
+
 func (p *Publisher[T]) Publish(pubCtx context.Context, data T) error {
 	p.subscribers.Range(func(subscriber *Subscriber[T], _ struct{}) bool {
 		select {
@@ -52,6 +53,7 @@ func (p *Publisher[T]) Publish(pubCtx context.Context, data T) error {
 	})
 	return nil
 }
+
 func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
 	ch := make(chan T, 1)
 	subscriber := &Subscriber[T]{
