@@ -14,6 +14,8 @@ type Subscriber[T any] struct {
 func (s *Subscriber[T]) Publish(ctx context.Context, data T) error {
 	select {
 	case s.ch <- data:
+	case <-s.subCtx.Done():
+		return s.subCtx.Err()
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -39,19 +41,16 @@ func (p *Publisher[T]) PublishChannel(ctx context.Context, pubChan chan T) {
 	}
 }
 
-func (p *Publisher[T]) Publish(pubCtx context.Context, data T) error {
+func (p *Publisher[T]) Publish(pubCtx context.Context, data T) []error {
+	var errs []error
 	p.subscribers.Range(func(subscriber *Subscriber[T], _ struct{}) bool {
-		select {
-		case subscriber.ch <- data:
-		case <-subscriber.subCtx.Done():
-			close(subscriber.ch)
-			p.subscribers.Delete(subscriber)
-		case <-pubCtx.Done():
-			return false
+		err := subscriber.Publish(pubCtx, data)
+		if err != nil {
+			errs = append(errs, err)
 		}
 		return true
 	})
-	return nil
+	return errs
 }
 
 func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
@@ -65,7 +64,6 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
 		select {
 		case eventSubscriber.ch <- subscriber:
 		case <-subCtx.Done():
-			close(ch)
 			p.subscribers.Delete(subscriber)
 			return false
 		}
