@@ -11,15 +11,15 @@ type Subscriber[T any] struct {
 	ch     chan T
 }
 
-func (s *Subscriber[T]) Publish(ctx context.Context, data T) error {
+func (s *Subscriber[T]) Publish(ctx context.Context, data T) bool {
 	select {
 	case s.ch <- data:
+		return true
 	case <-s.subCtx.Done():
-		return s.subCtx.Err()
+		return false
 	case <-ctx.Done():
-		return ctx.Err()
+		return false
 	}
-	return nil
 }
 
 type Publisher[T any] struct {
@@ -41,16 +41,14 @@ func (p *Publisher[T]) PublishChannel(ctx context.Context, pubChan chan T) {
 	}
 }
 
-func (p *Publisher[T]) Publish(pubCtx context.Context, data T) []error {
-	var errs []error
+func (p *Publisher[T]) Publish(pubCtx context.Context, data T) {
 	p.subscribers.Range(func(subscriber *Subscriber[T], _ struct{}) bool {
-		err := subscriber.Publish(pubCtx, data)
-		if err != nil {
-			errs = append(errs, err)
+		ok := subscriber.Publish(pubCtx, data)
+		if !ok {
+			p.subscribers.Delete(subscriber)
 		}
 		return true
 	})
-	return errs
 }
 
 func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
