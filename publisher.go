@@ -23,9 +23,8 @@ func (s *Subscriber[T]) Publish(ctx context.Context, data T) bool {
 }
 
 type Publisher[T any] struct {
-	subscribers              generic.SyncMap[*Subscriber[T], struct{}]
-	newSubscriberSubscribers generic.SyncMap[*Subscriber[*Subscriber[T]], struct{}]
-
+	subscribers     generic.SyncMap[*Subscriber[T], struct{}]
+	newSubscriberCh chan NewSubscriberEvent[T]
 	subscribeBufLen int
 }
 
@@ -58,25 +57,30 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
 		ch:     ch,
 	}
 	p.subscribers.Store(subscriber, struct{}{})
-	p.newSubscriberSubscribers.Range(func(eventSubscriber *Subscriber[*Subscriber[T]], _ struct{}) bool {
+	if p.newSubscriberCh != nil {
 		select {
-		case eventSubscriber.ch <- subscriber:
+		case p.newSubscriberCh <- NewSubscriberEvent[T]{subscriber: subscriber, ctx: subCtx}:
 		case <-subCtx.Done():
-			p.subscribers.Delete(subscriber)
-			return false
 		}
-		return true
-	})
+	}
 	return ch, nil
 }
-func (p *Publisher[T]) NewSubscriberChan(ctx context.Context) (<-chan *Subscriber[T], error) {
-	ch := make(chan *Subscriber[T], 1)
-	eventSubscriber := &Subscriber[*Subscriber[T]]{
-		subCtx: ctx,
-		ch:     ch,
-	}
-	p.newSubscriberSubscribers.Store(eventSubscriber, struct{}{})
-	return ch, nil
+
+type NewSubscriberEvent[T any] struct {
+	subscriber *Subscriber[T]
+	ctx        context.Context
+}
+
+func (p *NewSubscriberEvent[T]) Subscriber() *Subscriber[T] {
+	return p.subscriber
+}
+
+func (p *NewSubscriberEvent[T]) Ctx() context.Context {
+	return p.ctx
+}
+
+func (p *Publisher[T]) NewSubscriberC(ctx context.Context) <-chan NewSubscriberEvent[T] {
+	return p.newSubscriberCh
 }
 
 type PublisherOption[T any] func(p *Publisher[T])
@@ -84,6 +88,12 @@ type PublisherOption[T any] func(p *Publisher[T])
 func WithSubscriberBufLen[T any](bufLen int) PublisherOption[T] {
 	return func(p *Publisher[T]) {
 		p.subscribeBufLen = bufLen
+	}
+}
+
+func WithNewSubscriberChannel[T any](bufLen int) PublisherOption[T] {
+	return func(p *Publisher[T]) {
+		p.newSubscriberCh = make(chan NewSubscriberEvent[T], bufLen)
 	}
 }
 
