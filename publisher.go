@@ -50,7 +50,7 @@ func (p *Publisher[T]) Publish(pubCtx context.Context, data T) {
 		return true
 	})
 }
-func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
+func (p *Publisher[T]) Subscribe(subCtx context.Context) <-chan T {
 	ch := make(chan T, p.subscribeBufLen)
 	subscriber := &Subscriber[T]{
 		subCtx: subCtx,
@@ -63,7 +63,7 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) (<-chan T, error) {
 		case <-subCtx.Done():
 		}
 	}
-	return ch, nil
+	return ch
 }
 
 type NewSubscriberEvent[T any] struct {
@@ -79,7 +79,7 @@ func (p *NewSubscriberEvent[T]) Ctx() context.Context {
 	return p.ctx
 }
 
-func (p *Publisher[T]) NewSubscriberC(ctx context.Context) <-chan NewSubscriberEvent[T] {
+func (p *Publisher[T]) NewSubscriberC() <-chan NewSubscriberEvent[T] {
 	return p.newSubscriberCh
 }
 
