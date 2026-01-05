@@ -16,13 +16,12 @@ func (s *Subscriber[T]) Close() {
 func (s *Subscriber[T]) C() <-chan T {
 	return s.ch
 }
-func (s *Subscriber[T]) Send(ctx context.Context, data T) bool {
+func (s *Subscriber[T]) send(data T) bool {
 	select {
 	case s.ch <- data:
 		return true
 	case <-s.subCtx.Done():
-		return false
-	case <-ctx.Done():
+		s.Close()
 		return false
 	}
 }
