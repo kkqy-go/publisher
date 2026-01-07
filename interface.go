@@ -5,5 +5,5 @@ type EventConfig struct {
 	AutoPublishToNewSubscriber bool
 }
 type EventWithConfig interface {
-	Config() EventConfig
+	EventConfig() EventConfig
 }

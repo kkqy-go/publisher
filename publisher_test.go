@@ -25,16 +25,13 @@ func (e TestEvent) Config() EventConfig {
 // TestSnapshotOrder_FinalArch verifies the event order with the final API.
 func TestSnapshotOrder_FinalArch(t *testing.T) {
 	// 1. Setup
-	newSubEventCh := make(chan NewSubscriberEvent[TestEvent], 1)
-
-	// Create publisher with the new API: it returns the source channel.
-	p, sourceCh := NewPublisher[TestEvent](WithNewSubscriberEventChannel(newSubEventCh), WithSubBufLen[TestEvent](10))
-
-	runDone := make(chan struct{})
-	go func() {
-		p.Run()
-		close(runDone)
-	}()
+	p := NewPublisher[TestEvent](
+		WithNewSubscriberEventChannel[TestEvent](1),
+		WithSubBufLen[TestEvent](10),
+	)
+	sourceCh := p.C()
+	newSubEventCh := p.NewSubEventC()
+	defer p.Close()
 
 	// Publish an internal snapshot event to populate eventMap
 	internalSnapshotEvent := TestEvent{ID: "internal-1", IsSnapshot: true, Key: "key1"}
@@ -84,23 +81,14 @@ func TestSnapshotOrder_FinalArch(t *testing.T) {
 	if !reflect.DeepEqual(expectedOrder, receivedEvents) {
 		t.Errorf("Event order mismatch.\nExpected: %+v\nGot:      %+v", expectedOrder, receivedEvents)
 	}
-
-	// 6. Cleanup
-	close(sourceCh)
-	<-runDone
 }
 
 // TestSnapshot_SlowProviderWithSubscriberCancel_FinalArch verifies robustness with the final API.
 func TestSnapshot_SlowProviderWithSubscriberCancel_FinalArch(t *testing.T) {
 	// 1. Setup
-	newSubEventCh := make(chan NewSubscriberEvent[TestEvent], 1)
-	p, sourceCh := NewPublisher[TestEvent](WithNewSubscriberEventChannel(newSubEventCh))
-
-	runDone := make(chan struct{})
-	go func() {
-		p.Run()
-		close(runDone)
-	}()
+	p := NewPublisher[TestEvent](WithNewSubscriberEventChannel[TestEvent](1))
+	newSubEventCh := p.NewSubEventC()
+	defer p.Close()
 
 	// 2. Setup a SLOW snapshot provider
 	providerCommitDelay := 100 * time.Millisecond
@@ -109,7 +97,7 @@ func TestSnapshot_SlowProviderWithSubscriberCancel_FinalArch(t *testing.T) {
 		case event := <-newSubEventCh:
 			time.Sleep(providerCommitDelay)
 			event.Commit()
-		case <-time.After(providerCommitDelay + 50 * time.Millisecond):
+		case <-time.After(providerCommitDelay + 50*time.Millisecond):
 		}
 	}()
 
@@ -130,16 +118,66 @@ func TestSnapshot_SlowProviderWithSubscriberCancel_FinalArch(t *testing.T) {
 		t.Fatal("Test timed out: subscriber channel was not closed as expected.")
 	}
 
-	// 5. Final check for health
+	// 5. Final check for health of Subscribe on a running publisher
 	healthCheckCtx, healthCheckCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
-	defer healthCheckCancel()
-	p.Subscribe(healthCheckCtx)
+	healthCheckCancel()
+	p.Subscribe(healthCheckCtx) // This should not block
 
 	if healthCheckCtx.Err() == context.DeadlineExceeded {
 		t.Fatal("Publisher appears to be hung after a subscriber cancelled during snapshot.")
 	}
-
-	// 6. Cleanup
-	close(sourceCh)
-	<-runDone
 }
+
+// TestSubscribeOnClosedPublisher verifies that subscribing to a closed publisher
+
+// immediately returns a closed subscriber.
+
+func TestSubscribeOnClosedPublisher(t *testing.T) {
+
+	p := NewPublisher[TestEvent]()
+
+
+
+	p.Close()
+
+
+
+	// Allow a moment for the Run goroutine to exit and cleanup
+
+	time.Sleep(20 * time.Millisecond)
+
+
+
+	subCtx, subCancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+
+	defer subCancel()
+
+
+
+	closedSub := p.Subscribe(subCtx)
+
+
+
+	// A read from the subscriber's channel should not block and should indicate the channel is closed.
+
+	select {
+
+	case event, ok := <-closedSub.C():
+
+		if ok {
+
+			t.Fatalf("Channel from a new subscriber on a closed publisher should be closed, but received event: %+v", event)
+
+		}
+
+		// Correct behavior: ok is false, meaning channel is closed.
+
+	case <-time.After(50 * time.Millisecond):
+
+		t.Fatal("Reading from a new subscriber's channel on a closed publisher blocked.")
+
+	}
+
+}
+
+

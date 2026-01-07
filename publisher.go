@@ -2,7 +2,7 @@ package publisher
 
 import (
 	"context"
-	"fmt"
+	"fmt" // For logging errors from the Run goroutine
 	"reflect"
 	"sync/atomic"
 )
@@ -11,13 +11,16 @@ type config struct {
 	subBufLen int
 }
 type Publisher[T any] struct {
+	done                 chan struct{} // done is closed when the Run goroutine exits.
+	closedFlag           atomic.Bool   // Ensures Close() is idempotent.
 	eventMap             map[any]T
 	sourceCh             chan T // Publisher now creates and owns this channel
 	newSubCh             chan *Subscriber[T]
 	unSubCh              chan *Subscriber[T]
 	subscribers          map[*Subscriber[T]]struct{}
 	config               config
-	newSubscriberEventCh chan<- NewSubscriberEvent[T]
+	newSubscriberEventCh chan NewSubscriberEvent[T]
+	errorEventCh         chan error
 }
 
 func (p *Publisher[T]) Subscribe(subCtx context.Context) *Subscriber[T] {
@@ -29,6 +32,8 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) *Subscriber[T] {
 	}
 	select {
 	case p.newSubCh <- subscriber:
+	case <-p.done:
+		close(ch)
 	case <-subCtx.Done():
 		close(ch)
 	}
@@ -36,72 +41,32 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) *Subscriber[T] {
 }
 
 func (p *Publisher[T]) Unsubscribe(subscriber *Subscriber[T]) {
-	p.unSubCh <- subscriber
-}
-func (p *Publisher[T]) cleanup() {
-	for subscriber := range p.subscribers {
-		close(subscriber.ch)
+	select {
+	case p.unSubCh <- subscriber:
+	case <-p.done:
 	}
 }
-func (p *Publisher[T]) Run() error {
-	defer p.cleanup()
-	for {
-		select {
-		case event, ok := <-p.sourceCh:
-			if !ok {
-				// Source channel closed, publisher is shutting down.
-				return nil
-			}
-			var _e any = event
-			if e, ok := _e.(EventWithConfig); ok {
-				config := e.Config()
-				if config.AutoPublishToNewSubscriber && config.Key != nil {
-					keyType := reflect.TypeOf(config.Key)
-					if !keyType.Comparable() {
-						return fmt.Errorf("publisher: event key of type %s is not comparable", keyType)
-					}
-					p.eventMap[config.Key] = event
-				}
-			}
-			for subscriber := range p.subscribers {
-				subscriber.send(event)
-			}
-		case subscriber := <-p.newSubCh:
-			p.subscribers[subscriber] = struct{}{}
-			for _, event := range p.eventMap {
-				subscriber.send(event)
-			}
-			if p.newSubscriberEventCh != nil {
-				var closeFlag atomic.Bool
-				done := make(chan struct{})
-				newSubscriberEvent := NewSubscriberEvent[T]{
-					Send: func(ctx context.Context, event T) bool {
-						return subscriber.send(event)
-					},
-					Commit: func() {
-						if !closeFlag.Swap(true) {
-							close(done)
-						}
-					},
-				}
-				select {
-				case <-subscriber.subCtx.Done():
-					subscriber.Close()
-				case p.newSubscriberEventCh <- newSubscriberEvent:
-					select {
-					case <-done:
-					case <-subscriber.subCtx.Done():
-						subscriber.Close()
-					}
-				}
-			}
-		case subscriber := <-p.unSubCh:
-			if _, ok := p.subscribers[subscriber]; ok {
-				close(subscriber.ch)
-				delete(p.subscribers, subscriber)
-			}
-		}
+func (p *Publisher[T]) Publish(ctx context.Context, event T) {
+	select {
+	case p.sourceCh <- event:
+	case <-ctx.Done():
 	}
+}
+func (p *Publisher[T]) C() chan<- T {
+	return p.sourceCh
+}
+func (p *Publisher[T]) NewSubEventC() <-chan NewSubscriberEvent[T] {
+	return p.newSubscriberEventCh
+}
+func (p *Publisher[T]) ErrorC() <-chan error {
+	return p.errorEventCh
+}
+
+func (p *Publisher[T]) Close() {
+	if p.closedFlag.Swap(true) {
+		return
+	}
+	close(p.sourceCh)
 }
 
 type PublisherOption[T any] func(p *Publisher[T])
@@ -112,16 +77,30 @@ func WithSubBufLen[T any](bufLen int) PublisherOption[T] {
 	}
 }
 
-func WithNewSubscriberEventChannel[T any](ch chan<- NewSubscriberEvent[T]) PublisherOption[T] {
+func WithNewSubscriberEventChannel[T any](bufLen ...int) PublisherOption[T] {
+	if len(bufLen) == 0 {
+		bufLen = []int{0}
+	}
+	ch := make(chan NewSubscriberEvent[T], bufLen[0])
 	return func(p *Publisher[T]) {
 		p.newSubscriberEventCh = ch
 	}
 }
 
-func NewPublisher[T any](opts ...PublisherOption[T]) (*Publisher[T], chan<- T) {
-	sourceCh := make(chan T) // Create an unbuffered channel internally
+func WithErrorEventChannel[T any](bufLen ...int) PublisherOption[T] {
+	if len(bufLen) == 0 {
+		bufLen = []int{0}
+	}
+	ch := make(chan error, bufLen[0])
+	return func(p *Publisher[T]) {
+		p.errorEventCh = ch
+	}
+}
+
+func NewPublisher[T any](opts ...PublisherOption[T]) *Publisher[T] {
 	p := &Publisher[T]{
-		sourceCh:    sourceCh,
+		done:        make(chan struct{}),
+		sourceCh:    make(chan T),
 		subscribers: make(map[*Subscriber[T]]struct{}),
 		eventMap:    make(map[any]T),
 	}
@@ -130,5 +109,77 @@ func NewPublisher[T any](opts ...PublisherOption[T]) (*Publisher[T], chan<- T) {
 	}
 	p.newSubCh = make(chan *Subscriber[T], 1)
 	p.unSubCh = make(chan *Subscriber[T], 1)
-	return p, sourceCh
+
+	go func() {
+		cleanup := func() {
+			for subscriber := range p.subscribers {
+				close(subscriber.ch)
+			}
+			if p.newSubscriberEventCh != nil {
+				close(p.newSubscriberEventCh)
+			}
+			close(p.done)
+		}
+		defer cleanup()
+		for {
+			select {
+			case event, ok := <-p.sourceCh:
+				if !ok {
+					return
+				}
+				var _e any = event
+				if e, ok := _e.(EventWithConfig); ok {
+					config := e.EventConfig()
+					if config.AutoPublishToNewSubscriber && config.Key != nil {
+						keyType := reflect.TypeOf(config.Key)
+						if !keyType.Comparable() {
+							if p.errorEventCh != nil {
+								p.errorEventCh <- fmt.Errorf("publisher error: event key of type %s is not comparable", keyType)
+							}
+							return
+						}
+						p.eventMap[config.Key] = event
+					}
+				}
+				for subscriber := range p.subscribers {
+					subscriber.send(event)
+				}
+			case subscriber := <-p.newSubCh:
+				p.subscribers[subscriber] = struct{}{}
+				for _, event := range p.eventMap {
+					subscriber.send(event)
+				}
+				if p.newSubscriberEventCh != nil {
+					var closeFlag atomic.Bool
+					done := make(chan struct{})
+					newSubscriberEvent := NewSubscriberEvent[T]{
+						Send: func(ctx context.Context, event T) bool {
+							return subscriber.send(event)
+						},
+						Commit: func() {
+							if !closeFlag.Swap(true) {
+								close(done)
+							}
+						},
+					}
+					select {
+					case <-subscriber.subCtx.Done():
+						subscriber.Close()
+					case p.newSubscriberEventCh <- newSubscriberEvent:
+						select {
+						case <-done:
+						case <-subscriber.subCtx.Done():
+							subscriber.Close()
+						}
+					}
+				}
+			case subscriber := <-p.unSubCh:
+				if _, ok := p.subscribers[subscriber]; ok {
+					close(subscriber.ch)
+					delete(p.subscribers, subscriber)
+				}
+			}
+		}
+	}()
+	return p
 }
