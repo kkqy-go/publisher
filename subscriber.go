@@ -16,12 +16,17 @@ func (s *Subscriber[T]) Close() {
 func (s *Subscriber[T]) C() <-chan T {
 	return s.ch
 }
-func (s *Subscriber[T]) send(data T) bool {
+
+func (s *Subscriber[T]) Send(ctx context.Context, event T) {
 	select {
-	case s.ch <- data:
-		return true
+	case <-ctx.Done():
+		return
 	case <-s.subCtx.Done():
-		s.Close()
-		return false
+		return
+	case s.publisher.pendingEvents <- PendingEvent[T]{
+		subscriber: s,
+		event:      event,
+	}:
 	}
+
 }

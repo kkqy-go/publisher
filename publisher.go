@@ -10,6 +10,12 @@ import (
 type config struct {
 	subBufLen int
 }
+
+type PendingEvent[T any] struct {
+	subscriber *Subscriber[T]
+	event      T
+}
+
 type Publisher[T any] struct {
 	done                 chan struct{} // done is closed when the Run goroutine exits.
 	closedFlag           atomic.Bool   // Ensures Close() is idempotent.
@@ -19,7 +25,8 @@ type Publisher[T any] struct {
 	unSubCh              chan *Subscriber[T]
 	subscribers          map[*Subscriber[T]]struct{}
 	config               config
-	newSubscriberEventCh chan NewSubscriberEvent[T]
+	newSubscriberEventCh chan *Subscriber[T]
+	pendingEvents        chan PendingEvent[T]
 	errorEventCh         chan error
 }
 
@@ -37,6 +44,13 @@ func (p *Publisher[T]) Subscribe(subCtx context.Context) *Subscriber[T] {
 	case <-subCtx.Done():
 		close(ch)
 	}
+	go func() {
+		select {
+		case <-subCtx.Done():
+			p.Unsubscribe(subscriber)
+		case <-p.done:
+		}
+	}()
 	return subscriber
 }
 
@@ -55,7 +69,7 @@ func (p *Publisher[T]) Publish(ctx context.Context, event T) {
 func (p *Publisher[T]) C() chan<- T {
 	return p.sourceCh
 }
-func (p *Publisher[T]) NewSubEventC() <-chan NewSubscriberEvent[T] {
+func (p *Publisher[T]) NewSubscriberC() <-chan *Subscriber[T] {
 	return p.newSubscriberEventCh
 }
 func (p *Publisher[T]) ErrorC() <-chan error {
@@ -81,7 +95,7 @@ func WithNewSubscriberEventChannel[T any](bufLen ...int) PublisherOption[T] {
 	if len(bufLen) == 0 {
 		bufLen = []int{0}
 	}
-	ch := make(chan NewSubscriberEvent[T], bufLen[0])
+	ch := make(chan *Subscriber[T], bufLen[0])
 	return func(p *Publisher[T]) {
 		p.newSubscriberEventCh = ch
 	}
@@ -107,8 +121,9 @@ func NewPublisher[T any](opts ...PublisherOption[T]) *Publisher[T] {
 	for _, opt := range opts {
 		opt(p)
 	}
-	p.newSubCh = make(chan *Subscriber[T], 1)
-	p.unSubCh = make(chan *Subscriber[T], 1)
+	p.newSubCh = make(chan *Subscriber[T])
+	p.unSubCh = make(chan *Subscriber[T])
+	p.pendingEvents = make(chan PendingEvent[T])
 
 	go func() {
 		cleanup := func() {
@@ -119,6 +134,10 @@ func NewPublisher[T any](opts ...PublisherOption[T]) *Publisher[T] {
 				close(p.newSubscriberEventCh)
 			}
 			close(p.done)
+		}
+		unsubscribe := func(subscriber *Subscriber[T]) {
+			close(subscriber.ch)
+			delete(p.subscribers, subscriber)
 		}
 		defer cleanup()
 		for {
@@ -142,41 +161,40 @@ func NewPublisher[T any](opts ...PublisherOption[T]) *Publisher[T] {
 					}
 				}
 				for subscriber := range p.subscribers {
-					subscriber.send(event)
+					select {
+					case <-subscriber.subCtx.Done():
+						unsubscribe(subscriber)
+					case subscriber.ch <- event:
+					}
 				}
 			case subscriber := <-p.newSubCh:
 				p.subscribers[subscriber] = struct{}{}
 				for _, event := range p.eventMap {
-					subscriber.send(event)
-				}
-				if p.newSubscriberEventCh != nil {
-					var closeFlag atomic.Bool
-					done := make(chan struct{})
-					newSubscriberEvent := NewSubscriberEvent[T]{
-						Send: func(ctx context.Context, event T) bool {
-							return subscriber.send(event)
-						},
-						Commit: func() {
-							if !closeFlag.Swap(true) {
-								close(done)
-							}
-						},
-					}
 					select {
 					case <-subscriber.subCtx.Done():
-						subscriber.Close()
-					case p.newSubscriberEventCh <- newSubscriberEvent:
-						select {
-						case <-done:
-						case <-subscriber.subCtx.Done():
-							subscriber.Close()
-						}
+						unsubscribe(subscriber)
+					case subscriber.ch <- event:
+					}
+				}
+				if p.newSubscriberEventCh != nil {
+					select {
+					case <-subscriber.subCtx.Done():
+						unsubscribe(subscriber)
+					case p.newSubscriberEventCh <- subscriber:
 					}
 				}
 			case subscriber := <-p.unSubCh:
 				if _, ok := p.subscribers[subscriber]; ok {
-					close(subscriber.ch)
-					delete(p.subscribers, subscriber)
+					unsubscribe(subscriber)
+				}
+			case pendingEvent := <-p.pendingEvents:
+				subscriber := pendingEvent.subscriber
+				if _, ok := p.subscribers[subscriber]; ok {
+					select {
+					case <-pendingEvent.subscriber.subCtx.Done():
+						unsubscribe(subscriber)
+					case pendingEvent.subscriber.ch <- pendingEvent.event:
+					}
 				}
 			}
 		}
